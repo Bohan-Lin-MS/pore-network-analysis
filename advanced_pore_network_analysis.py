@@ -11,6 +11,7 @@ from skimage.measure import label, regionprops, marching_cubes
 from skimage.morphology import remove_small_objects
 from mpl_toolkits.mplot3d import Axes3D
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+from matplotlib.widgets import Slider
 import time
 
 # 忽略警告
@@ -27,14 +28,33 @@ except ImportError:
     print("⚠️  使用預設後端，可視化可能較慢")
 
 # 設定中文字體和高品質渲染
-plt.rcParams['font.family'] = 'DejaVu Sans'
+try:
+    # 嘗試使用系統中文字體
+    import matplotlib.font_manager as fm
+    chinese_fonts = ['Microsoft YaHei', 'SimHei', 'WenQuanYi Micro Hei', 'DejaVu Sans']
+    for font in chinese_fonts:
+        if any(font in f.name for f in fm.fontManager.ttflist):
+            plt.rcParams['font.family'] = font
+            print(f"✓ 使用字體: {font}")
+            break
+    else:
+        plt.rcParams['font.family'] = 'DejaVu Sans'
+        print("⚠️  使用預設字體，中文可能無法正常顯示")
+except:
+    plt.rcParams['font.family'] = 'DejaVu Sans'
+    print("⚠️  字體設定失敗，使用預設字體")
+
+plt.rcParams['font.size'] = 10
+plt.rcParams['axes.unicode_minus'] = False  # 解決負號顯示問題
 plt.rcParams['figure.dpi'] = 100
 plt.rcParams['savefig.dpi'] = 300
 
 # 設定基本參數
 PIXEL_SIZE = 0.65  # μm/pixel
 SHOW_SOLID_STRUCTURE = True  # 是否顯示固體結構
-SOLID_ALPHA = 0.1  # 固體結構透明度
+SOLID_ALPHA = 0.1  # 固體結構透明度 (不透明模式下不使用)
+USE_CROSS_SECTION = True  # 使用剖面模式而非透明模式
+INITIAL_SECTION_RATIO = 0.5  # 初始剖面比例 (0.0-1.0)
 
 print("=== 🚀 進階孔隙網路分析系統 ===")
 print("與OpenPNM對比的改進版本")
@@ -272,19 +292,39 @@ def advanced_throat_modeling(pore_centers, pore_diameters):
     
     return throat_connections, throat_lengths, throat_diameters
 
-def create_solid_structure_mesh(im_3d, subsample_rate=4):
+def create_solid_structure_mesh(im_3d, subsample_rate=4, section_ratio=0.5):
     """
     創建固體結構的3D網格
     使用Marching Cubes算法重建固體表面
+    支援剖面顯示模式
+    
+    Parameters:
+    -----------
+    im_3d : ndarray
+        3D影像數據
+    subsample_rate : int
+        降採樣率
+    section_ratio : float
+        剖面比例 (0.0-1.0)，控制顯示多少固體結構
     """
     print(f"\n=== 🏗️ 固體結構3D重建 ===")
     
     if not SHOW_SOLID_STRUCTURE:
-        return None, None
+        return None, None, im_3d.shape
     
     print("步驟1: 準備固體結構數據...")
     # 固體結構 (0值) 轉換為可視化格式
     solid_structure = (im_3d == 0).astype(np.uint8)
+    
+    # 如果使用剖面模式，只顯示一部分固體結構
+    if USE_CROSS_SECTION:
+        depth, height, width = solid_structure.shape
+        section_depth = int(depth * section_ratio)
+        # 創建剖面：從一側開始逐漸移除固體
+        solid_structure_sectioned = solid_structure.copy()
+        solid_structure_sectioned[section_depth:, :, :] = 0  # 移除後半部分
+        solid_structure = solid_structure_sectioned
+        print(f"  剖面模式: 顯示前 {section_ratio:.1%} 深度 ({section_depth}/{depth} 層)")
     
     # 降採樣以提高性能
     if subsample_rate > 1:
@@ -309,17 +349,17 @@ def create_solid_structure_mesh(im_3d, subsample_rate=4):
         print(f"  頂點數: {len(verts)}")
         print(f"  面數: {len(faces)}")
         
-        return verts, faces
+        return verts, faces, im_3d.shape
         
     except Exception as e:
         print(f"❌ 固體結構重建失敗: {e}")
-        return None, None
+        return None, None, im_3d.shape
 
 def create_advanced_visualization(pore_centers, pore_diameters, throat_connections, 
-                                throat_diameters, porosity, solid_verts=None, solid_faces=None):
+                                throat_diameters, porosity, im_3d, solid_verts=None, solid_faces=None, im_shape=None):
     """
     創建進階的GPU加速3D可視化
-    包含孔隙網路和固體結構
+    包含孔隙網路和固體結構，支援滑軌控制剖面顯示
     """
     print(f"\n=== 🎨 創建進階3D可視化 ===")
     
@@ -328,16 +368,36 @@ def create_advanced_visualization(pore_centers, pore_diameters, throat_connectio
         return
     
     # 創建高品質圖形
-    fig = plt.figure(figsize=(16, 12))
+    fig = plt.figure(figsize=(18, 12))
     if HAS_GPU_SUPPORT:
         fig.canvas.toolbar_visible = True  # 啟用工具列
     
-    ax = fig.add_subplot(111, projection='3d')
+    # 創建主要的3D子圖
+    ax = fig.add_subplot(121, projection='3d')  # 左側為3D圖
+    
+    # 創建滑軌控制區域
+    from matplotlib.widgets import Slider
+    
+    # 為滑軌預留空間
+    plt.subplots_adjust(left=0.1, right=0.9, bottom=0.25, top=0.9)
+    
+    # 全局變量存儲當前剖面比例
+    current_section_ratio = [INITIAL_SECTION_RATIO]
     
     # 轉換座標
     coords_um = pore_centers * PIXEL_SIZE
     
-    print("步驟1: 繪製孔隙網路...")
+    print("步驟1: 建立互動式剖面控制...")
+    
+    # 建立滑軌軸位置
+    ax_slider = plt.axes([0.15, 0.1, 0.35, 0.03])
+    slider = Slider(ax_slider, '剖面深度', 0.0, 1.0, valinit=INITIAL_SECTION_RATIO, 
+                   valstep=0.02, valfmt='%.0f%%')
+    
+    # 設定滑軌標籤和樣式
+    ax_slider.set_xlabel('拖動滑軌調整固體結構剖面顯示比例', fontsize=10)
+    
+    print("步驟2: 繪製孔隙網路...")
     
     # 孔隙可視化：大小和顏色雙重編碼
     min_size, max_size = 20, 1000
@@ -355,11 +415,14 @@ def create_advanced_visualization(pore_centers, pore_diameters, throat_connectio
                         s=normalized_sizes,
                         c=pore_diameters,
                         cmap='plasma',
-                        alpha=0.8,
+                        alpha=0.9,
                         edgecolors='black',
                         linewidth=0.5)
     
-    print("步驟2: 繪製喉道連接...")
+    print("步驟3: 繪製喉道連接...")
+    
+    # 存儲喉道線條對象以便更新
+    throat_lines = []
     
     # 喉道可視化
     if len(throat_connections) > 0:
@@ -369,62 +432,126 @@ def create_advanced_visualization(pore_centers, pore_diameters, throat_connectio
                 max_throat_diameter = throat_diameters.max() if len(throat_diameters) > 0 else 1
                 line_width = max(0.3, (throat_diameters[k] / max_throat_diameter) * 3.0)
                 
-                ax.plot([coords_um[i, 2], coords_um[j, 2]],
-                       [coords_um[i, 1], coords_um[j, 1]], 
-                       [coords_um[i, 0], coords_um[j, 0]],
-                       color='darkgray', linewidth=line_width, alpha=0.6)
+                line = ax.plot([coords_um[i, 2], coords_um[j, 2]],
+                              [coords_um[i, 1], coords_um[j, 1]], 
+                              [coords_um[i, 0], coords_um[j, 0]],
+                              color='darkgray', linewidth=line_width, alpha=0.7)[0]
+                throat_lines.append(line)
     
-    print("步驟3: 添加固體結構...")
+    print("步驟4: 建立動態固體結構更新系統...")
     
-    # 固體結構可視化
-    if solid_verts is not None and solid_faces is not None:
-        try:
-            # 創建半透明的固體結構
-            solid_mesh = [[solid_verts[j] for j in solid_faces[i]] for i in range(len(solid_faces))]
-            solid_collection = Poly3DCollection(solid_mesh, 
-                                              alpha=SOLID_ALPHA,
-                                              facecolor='lightblue',
-                                              edgecolor='none')
-            ax.add_collection3d(solid_collection)
-            print(f"  ✓ 添加固體結構 (透明度: {SOLID_ALPHA})")
-        except Exception as e:
-            print(f"  ⚠️  固體結構顯示失敗: {e}")
+    # 存儲固體結構集合以便更新
+    solid_collection = None
     
-    # 設定圖表屬性
-    print("步驟4: 設定圖表屬性...")
+    def update_solid_structure(section_ratio):
+        """根據滑軌值更新固體結構顯示"""
+        nonlocal solid_collection
+        
+        # 移除舊的固體結構
+        if solid_collection is not None:
+            solid_collection.remove()
+            solid_collection = None
+        
+        if section_ratio > 0 and SHOW_SOLID_STRUCTURE:
+            try:
+                # 重新生成帶剖面的固體結構
+                verts_new, faces_new, _ = create_solid_structure_mesh(im_3d, 
+                                                                    subsample_rate=8, 
+                                                                    section_ratio=section_ratio)
+                
+                if verts_new is not None and faces_new is not None:
+                    # 創建新的固體結構網格
+                    solid_mesh = [[verts_new[j] for j in faces_new[i]] for i in range(len(faces_new))]
+                    solid_collection = Poly3DCollection(solid_mesh, 
+                                                      alpha=0.3,
+                                                      facecolor='lightsteelblue',
+                                                      edgecolor='gray',
+                                                      linewidth=0.1)
+                    ax.add_collection3d(solid_collection)
+                    
+            except Exception as e:
+                print(f"更新固體結構失敗: {e}")
+        
+        # 更新顯示
+        fig.canvas.draw_idle()
     
-    ax.set_xlabel('X (μm)', fontsize=12, fontweight='bold')
-    ax.set_ylabel('Y (μm)', fontsize=12, fontweight='bold')
-    ax.set_zlabel('Z (μm)', fontsize=12, fontweight='bold')
-    
-    # 標題
-    title = f'進階孔隙網路分析 vs OpenPNM\n孔隙: {len(pore_centers)} | 喉道: {len(throat_connections)} | 孔隙率: {porosity*100:.1f}%'
-    ax.set_title(title, fontsize=16, fontweight='bold', pad=20)
-    
-    # 顏色條
-    cbar = plt.colorbar(scatter, ax=ax, shrink=0.6, aspect=25, pad=0.1)
-    cbar.set_label('孔隙直徑 (μm)', fontsize=12, fontweight='bold')
-    
-    # 統計信息
-    stats_text = f"""🚀 改進特性:
+    # 滑軌響應函數
+    def on_slider_change(val):
+        """滑軌值改變時的響應函數"""
+        current_section_ratio[0] = val
+        update_solid_structure(val)
+        
+        # 更新統計信息
+        stats_text = f"""🚀 改進特性:
 • KD樹空間索引 (O(log n))
-• 自適應參數調整
+• 自適應參數調整  
 • GPU加速可視化
-• 固體結構重建
+• 動態剖面控制
 • 多重物理約束
 
 📊 網路統計:
 • 孔隙數: {len(pore_centers)}
 • 喉道數: {len(throat_connections)}
 • 平均直徑: {pore_diameters.mean():.1f} μm
-• 孔隙率: {porosity*100:.1f}%"""
+• 孔隙率: {porosity*100:.1f}%
+
+🔧 剖面控制:
+• 顯示深度: {val:.1%}
+• 剖面層數: {int(im_shape[0] * val if im_shape else 0)}/{im_shape[0] if im_shape else 0}"""
+        
+        # 更新文字（如果存在）
+        if hasattr(ax, '_stats_text'):
+            ax._stats_text.remove()
+        
+        ax._stats_text = ax.text2D(0.02, 0.98, stats_text, transform=ax.transAxes, fontsize=9,
+                                 verticalalignment='top', fontweight='bold',
+                                 bbox=dict(boxstyle='round,pad=0.5', facecolor='lightgreen', alpha=0.8))
+        
+    # 連接滑軌事件
+    slider.on_changed(on_slider_change)
     
-    ax.text2D(0.02, 0.98, stats_text, transform=ax.transAxes, fontsize=10,
-             verticalalignment='top', fontweight='bold',
-             bbox=dict(boxstyle='round,pad=0.5', facecolor='lightgreen', alpha=0.8))
+    # 初始化固體結構顯示
+    update_solid_structure(INITIAL_SECTION_RATIO)
+    
+    # 設定圖表屬性
+    print("步驟5: 設定圖表屬性...")
+    
+    ax.set_xlabel('X (μm)', fontsize=12, fontweight='bold')
+    ax.set_ylabel('Y (μm)', fontsize=12, fontweight='bold')
+    ax.set_zlabel('Z (μm)', fontsize=12, fontweight='bold')
+    
+    # 標題
+    title = f'進階孔隙網路分析 - 互動式剖面控制\n孔隙: {len(pore_centers)} | 喉道: {len(throat_connections)} | 孔隙率: {porosity*100:.1f}%'
+    ax.set_title(title, fontsize=14, fontweight='bold', pad=20)
+    
+    # 顏色條
+    cbar = plt.colorbar(scatter, ax=ax, shrink=0.6, aspect=25, pad=0.05)
+    cbar.set_label('孔隙直徑 (μm)', fontsize=12, fontweight='bold')
+    
+    # 初始統計信息
+    initial_stats_text = f"""🚀 改進特性:
+• KD樹空間索引 (O(log n))
+• 自適應參數調整  
+• GPU加速可視化
+• 動態剖面控制
+• 多重物理約束
+
+📊 網路統計:
+• 孔隙數: {len(pore_centers)}
+• 喉道數: {len(throat_connections)}
+• 平均直徑: {pore_diameters.mean():.1f} μm
+• 孔隙率: {porosity*100:.1f}%
+
+🔧 剖面控制:
+• 顯示深度: {INITIAL_SECTION_RATIO:.1%}
+• 剖面層數: {int(im_shape[0] * INITIAL_SECTION_RATIO if im_shape else 0)}/{im_shape[0] if im_shape else 0}"""
+    
+    ax._stats_text = ax.text2D(0.02, 0.98, initial_stats_text, transform=ax.transAxes, fontsize=9,
+                              verticalalignment='top', fontweight='bold',
+                              bbox=dict(boxstyle='round,pad=0.5', facecolor='lightgreen', alpha=0.8))
     
     # 設定視角
-    ax.view_init(elev=20, azim=45)
+    ax.view_init(elev=25, azim=45)
     
     # 啟用互動模式
     if HAS_GPU_SUPPORT:
@@ -438,8 +565,13 @@ def create_advanced_visualization(pore_centers, pore_diameters, throat_connectio
         print("  • GPU加速：支援流暢旋轉和縮放")
     print("  • 孔隙：大小和顏色表示直徑")
     print("  • 喉道：線條粗細表示直徑")
-    if solid_verts is not None:
-        print(f"  • 固體：半透明結構 (透明度: {SOLID_ALPHA})")
+    print("  • 剖面控制：拖動底部滑軌調整固體結構顯示深度")
+    print("  • 驗證功能：通過剖面可查看孔隙網路是否正確位於孔隙內")
+    print("\n📝 使用說明:")
+    print("  1. 鼠標拖動：旋轉視角")
+    print("  2. 滾輪：縮放")
+    print("  3. 滑軌：控制固體結構剖面深度 (0% = 完全隱藏, 100% = 完全顯示)")
+    print("  4. 通過調整滑軌可驗證孔隙網路是否準確位於真實孔隙空間內")
 
 def main():
     """主程式"""
@@ -457,12 +589,13 @@ def main():
         # 喉道建模
         throat_connections, throat_lengths, throat_diameters = advanced_throat_modeling(pore_centers, pore_diameters)
         
-        # 固體結構重建
-        solid_verts, solid_faces = create_solid_structure_mesh(im_3d, subsample_rate=8)
+        # 固體結構重建 (初始)
+        solid_verts, solid_faces, im_shape = create_solid_structure_mesh(im_3d, subsample_rate=8, 
+                                                                        section_ratio=INITIAL_SECTION_RATIO)
         
-        # 可視化
+        # 可視化 (傳入完整影像數據以支援動態更新)
         create_advanced_visualization(pore_centers, pore_diameters, throat_connections, 
-                                    throat_diameters, porosity, solid_verts, solid_faces)
+                                    throat_diameters, porosity, im_3d, solid_verts, solid_faces, im_shape)
         
         # 結果摘要
         print(f"\n=== 🎯 vs OpenPNM 比較摘要 ===")
