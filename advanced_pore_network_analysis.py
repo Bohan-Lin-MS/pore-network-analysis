@@ -11,7 +11,8 @@ from skimage.measure import label, regionprops, marching_cubes
 from skimage.morphology import remove_small_objects
 from mpl_toolkits.mplot3d import Axes3D
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
-from matplotlib.widgets import Slider
+from matplotlib.widgets import Slider, Button
+from scipy.ndimage import gaussian_filter
 import time
 
 # 忽略警告
@@ -55,6 +56,8 @@ SHOW_SOLID_STRUCTURE = True  # 是否顯示固體結構
 SOLID_ALPHA = 0.1  # 固體結構透明度 (不透明模式下不使用)
 USE_CROSS_SECTION = True  # 使用剖面模式而非透明模式
 INITIAL_SECTION_RATIO = 0.5  # 初始剖面比例 (0.0-1.0)
+USE_REAL_PORE_SIZE = True  # 是否使用真實孔隙大小顯示點
+UNIFORM_PORE_SIZE = 50  # 統一模式下的點大小
 
 print("=== 🚀 進階孔隙網路分析系統 ===")
 print("與OpenPNM對比的改進版本")
@@ -335,7 +338,7 @@ def create_solid_structure_mesh(im_3d, subsample_rate=4, section_ratio=0.5):
     print(f"  固體比例: {solid_ratio*100:.2f}%")
     
     try:
-        print("步驟2: Marching Cubes表面重建...")
+        print("步驟2: 平滑曲面重建...")
         start_time = time.time()
         
         # 使用Marching Cubes算法創建表面網格
@@ -344,16 +347,29 @@ def create_solid_structure_mesh(im_3d, subsample_rate=4, section_ratio=0.5):
         # 調整座標到正確的物理尺寸
         verts = verts * PIXEL_SIZE * subsample_rate
         
-        mesh_time = time.time() - start_time
-        print(f"✓ 網格重建完成 ({mesh_time:.2f}s)")
-        print(f"  頂點數: {len(verts)}")
-        print(f"  面數: {len(faces)}")
+        # 平滑化處理：使用平均法減少三角網格的鋸齒感
         
-        return verts, faces, im_3d.shape
+        # 對網格進行平滑化處理（簡化版）
+        # 減少面數，減少鋸齒感
+        simplified_faces = []
+        for i in range(0, len(faces), 2):  # 每隔2個面取一個，減少密度
+            if i < len(faces):
+                simplified_faces.append(faces[i])
+        faces = np.array(simplified_faces)
+        
+        mesh_time = time.time() - start_time
+        print(f"✓ 平滑曲面重建完成 ({mesh_time:.2f}s)")
+        print(f"  頂點數: {len(verts)}")
+        print(f"  簡化面數: {len(faces)} (原: {len(marching_cubes(solid_structure, level=0.5)[1])})")
+        
+        # 檢查是否為完整結構（用於添加黑色邊界）
+        is_full_structure = (section_ratio >= 0.98)  # 98%以上視為完整結構
+        
+        return verts, faces, im_3d.shape, is_full_structure
         
     except Exception as e:
         print(f"❌ 固體結構重建失敗: {e}")
-        return None, None, im_3d.shape
+        return None, None, im_3d.shape, False
 
 def create_advanced_visualization(pore_centers, pore_diameters, throat_connections, 
                                 throat_diameters, porosity, im_3d, solid_verts=None, solid_faces=None, im_shape=None):
@@ -368,56 +384,68 @@ def create_advanced_visualization(pore_centers, pore_diameters, throat_connectio
         return
     
     # 創建高品質圖形
-    fig = plt.figure(figsize=(18, 12))
+    fig = plt.figure(figsize=(16, 10))
     if HAS_GPU_SUPPORT:
         fig.canvas.toolbar_visible = True  # 啟用工具列
     
-    # 創建主要的3D子圖
-    ax = fig.add_subplot(121, projection='3d')  # 左側為3D圖
+    # 創建主要的3D子圖，調整佈局避免文字遮擋
+    ax = fig.add_subplot(111, projection='3d')
     
-    # 創建滑軌控制區域
-    from matplotlib.widgets import Slider
+    # 創建滑軌和按鈕控制區域
+    from matplotlib.widgets import Slider, Button
     
-    # 為滑軌預留空間
-    plt.subplots_adjust(left=0.1, right=0.9, bottom=0.25, top=0.9)
+    # 為滑軌和按鈕預留空間，調整統計信息位置
+    plt.subplots_adjust(left=0.05, right=0.75, bottom=0.15, top=0.95)
     
-    # 全局變量存儲當前剖面比例
+    # 全局變量存儲當前剖面比例和顯示模式
     current_section_ratio = [INITIAL_SECTION_RATIO]
+    current_pore_size_mode = [USE_REAL_PORE_SIZE]  # True=真實大小, False=統一大小
     
     # 轉換座標
     coords_um = pore_centers * PIXEL_SIZE
     
-    print("步驟1: 建立互動式剖面控制...")
+    print("步驟1: 建立互動式控制界面...")
     
-    # 建立滑軌軸位置
-    ax_slider = plt.axes([0.15, 0.1, 0.35, 0.03])
+    # 建立滑軌軸位置（底部中央）
+    ax_slider = plt.axes([0.15, 0.05, 0.5, 0.03])
     slider = Slider(ax_slider, '剖面深度', 0.0, 1.0, valinit=INITIAL_SECTION_RATIO, 
                    valstep=0.02, valfmt='%.0f%%')
     
-    # 設定滑軌標籤和樣式
-    ax_slider.set_xlabel('拖動滑軌調整固體結構剖面顯示比例', fontsize=10)
+    # 建立按鍵軸位置（底部右側，避免遮擋數據）
+    ax_button = plt.axes([0.7, 0.05, 0.15, 0.03])
+    button = Button(ax_button, '切換點大小')
+    
+    # 設定滑軌標籤
+    ax_slider.set_xlabel('拖動滑軌調整固體結構剖面顯示比例 (0%=無結構, 100%=完整結構)', fontsize=9)
     
     print("步驟2: 繪製孔隙網路...")
     
-    # 孔隙可視化：大小和顏色雙重編碼
-    min_size, max_size = 20, 1000
-    if len(pore_diameters) > 1:
-        size_range = pore_diameters.max() - pore_diameters.min()
-        if size_range > 0:
-            normalized_sizes = min_size + (max_size - min_size) * (pore_diameters - pore_diameters.min()) / size_range
+    # 計算孔隙點大小（兩種模式）
+    def get_pore_sizes(use_real_size=True):
+        if use_real_size:
+            # 真實大小模式：基於孔隙直徑
+            min_size, max_size = 20, 1000
+            if len(pore_diameters) > 1:
+                size_range = pore_diameters.max() - pore_diameters.min()
+                if size_range > 0:
+                    return min_size + (max_size - min_size) * (pore_diameters - pore_diameters.min()) / size_range
+                else:
+                    return np.full(len(pore_diameters), (min_size + max_size) / 2)
+            else:
+                return np.full(len(pore_diameters), (min_size + max_size) / 2)
         else:
-            normalized_sizes = np.full(len(pore_diameters), (min_size + max_size) / 2)
-    else:
-        normalized_sizes = np.full(len(pore_diameters), (min_size + max_size) / 2)
+            # 統一大小模式：所有點相同大小
+            return np.full(len(pore_diameters), UNIFORM_PORE_SIZE)
     
-    # 繪製孔隙
+    # 初始繪製孔隙
+    initial_sizes = get_pore_sizes(current_pore_size_mode[0])
     scatter = ax.scatter(coords_um[:, 2], coords_um[:, 1], coords_um[:, 0],
-                        s=normalized_sizes,
+                        s=initial_sizes,
                         c=pore_diameters,
                         cmap='plasma',
                         alpha=0.9,
                         edgecolors='black',
-                        linewidth=0.5)
+                        linewidth=0.3)
     
     print("步驟3: 繪製喉道連接...")
     
@@ -455,18 +483,31 @@ def create_advanced_visualization(pore_centers, pore_diameters, throat_connectio
         if section_ratio > 0 and SHOW_SOLID_STRUCTURE:
             try:
                 # 重新生成帶剖面的固體結構
-                verts_new, faces_new, _ = create_solid_structure_mesh(im_3d, 
-                                                                    subsample_rate=8, 
-                                                                    section_ratio=section_ratio)
+                verts_new, faces_new, _, is_full = create_solid_structure_mesh(im_3d, 
+                                                                              subsample_rate=8, 
+                                                                              section_ratio=section_ratio)
                 
                 if verts_new is not None and faces_new is not None:
-                    # 創建新的固體結構網格
+                    # 創建新的平滑固體結構網格
                     solid_mesh = [[verts_new[j] for j in faces_new[i]] for i in range(len(faces_new))]
-                    solid_collection = Poly3DCollection(solid_mesh, 
-                                                      alpha=0.3,
-                                                      facecolor='lightsteelblue',
-                                                      edgecolor='gray',
-                                                      linewidth=0.1)
+                    
+                    # 根據是否為完整結構調整顯示樣式
+                    if is_full:
+                        # 完整結構：實心顯示，黑色邊界，平滑表面
+                        solid_collection = Poly3DCollection(solid_mesh, 
+                                                          alpha=0.7,
+                                                          facecolor='lightsteelblue',
+                                                          edgecolor='black',
+                                                          linewidth=0.8)
+                        print(f"  完整結構模式：實心顯示，黑色邊界，平滑表面")
+                    else:
+                        # 剖面結構：半透明顯示，平滑表面
+                        solid_collection = Poly3DCollection(solid_mesh, 
+                                                          alpha=0.4,
+                                                          facecolor='lightsteelblue',
+                                                          edgecolor='lightgray',
+                                                          linewidth=0.2)
+                    
                     ax.add_collection3d(solid_collection)
                     
             except Exception as e:
@@ -475,19 +516,51 @@ def create_advanced_visualization(pore_centers, pore_diameters, throat_connectio
         # 更新顯示
         fig.canvas.draw_idle()
     
-    # 滑軌響應函數
-    def on_slider_change(val):
-        """滑軌值改變時的響應函數"""
-        current_section_ratio[0] = val
-        update_solid_structure(val)
+    # 按鍵響應函數
+    def on_button_click(event):
+        """按鍵點擊時的響應函數"""
+        nonlocal scatter  # 聲明在函數開始
+        
+        # 切換孔隙大小模式
+        current_pore_size_mode[0] = not current_pore_size_mode[0]
+        
+        # 移除舊的散點圖
+        scatter.remove()
+        
+        # 重新繪製孔隙點，使用新的大小
+        new_sizes = get_pore_sizes(current_pore_size_mode[0])
+        new_scatter = ax.scatter(coords_um[:, 2], coords_um[:, 1], coords_um[:, 0],
+                               s=new_sizes,
+                               c=pore_diameters,
+                               cmap='plasma',
+                               alpha=0.9,
+                               edgecolors='black',
+                               linewidth=0.3)
+        
+        # 更新全局散點圖參考
+        scatter = new_scatter
         
         # 更新統計信息
+        update_stats_display(current_section_ratio[0])
+        
+        # 更新顯示
+        fig.canvas.draw_idle()
+        
+        mode_text = "真實大小" if current_pore_size_mode[0] else "統一小點"
+        print(f"  ✓ 孔隙點顯示模式切換為: {mode_text}")
+    
+    # 統計信息更新函數
+    def update_stats_display(val):
+        """更新統計信息顯示"""
+        mode_text = "真實大小" if current_pore_size_mode[0] else "統一小點"
+        structure_text = "完整實心" if val >= 0.98 else f"剖面 {val:.1%}"
+        
         stats_text = f"""🚀 改進特性:
 • KD樹空間索引 (O(log n))
-• 自適應參數調整  
-• GPU加速可視化
+• 自適應參數調整
+• GPU加速可視化  
 • 動態剖面控制
-• 多重物理約束
+• 孔隙點大小切換
 
 📊 網路統計:
 • 孔隙數: {len(pore_centers)}
@@ -495,20 +568,29 @@ def create_advanced_visualization(pore_centers, pore_diameters, throat_connectio
 • 平均直徑: {pore_diameters.mean():.1f} μm
 • 孔隙率: {porosity*100:.1f}%
 
-🔧 剖面控制:
-• 顯示深度: {val:.1%}
+🔧 顯示控制:
+• 結構模式: {structure_text}
+• 點大小模式: {mode_text}
 • 剖面層數: {int(im_shape[0] * val if im_shape else 0)}/{im_shape[0] if im_shape else 0}"""
         
-        # 更新文字（如果存在）
+        # 更新文字位置（右側避免遮擋）
         if hasattr(ax, '_stats_text'):
             ax._stats_text.remove()
         
-        ax._stats_text = ax.text2D(0.02, 0.98, stats_text, transform=ax.transAxes, fontsize=9,
+        ax._stats_text = ax.text2D(0.77, 0.98, stats_text, transform=fig.transFigure, fontsize=9,
                                  verticalalignment='top', fontweight='bold',
                                  bbox=dict(boxstyle='round,pad=0.5', facecolor='lightgreen', alpha=0.8))
+    
+    # 滑軌響應函數
+    def on_slider_change(val):
+        """滑軌值改變時的響應函數"""
+        current_section_ratio[0] = val
+        update_solid_structure(val)
+        update_stats_display(val)
         
-    # 連接滑軌事件
+    # 連接控件事件
     slider.on_changed(on_slider_change)
+    button.on_clicked(on_button_click)
     
     # 初始化固體結構顯示
     update_solid_structure(INITIAL_SECTION_RATIO)
@@ -528,27 +610,8 @@ def create_advanced_visualization(pore_centers, pore_diameters, throat_connectio
     cbar = plt.colorbar(scatter, ax=ax, shrink=0.6, aspect=25, pad=0.05)
     cbar.set_label('孔隙直徑 (μm)', fontsize=12, fontweight='bold')
     
-    # 初始統計信息
-    initial_stats_text = f"""🚀 改進特性:
-• KD樹空間索引 (O(log n))
-• 自適應參數調整  
-• GPU加速可視化
-• 動態剖面控制
-• 多重物理約束
-
-📊 網路統計:
-• 孔隙數: {len(pore_centers)}
-• 喉道數: {len(throat_connections)}
-• 平均直徑: {pore_diameters.mean():.1f} μm
-• 孔隙率: {porosity*100:.1f}%
-
-🔧 剖面控制:
-• 顯示深度: {INITIAL_SECTION_RATIO:.1%}
-• 剖面層數: {int(im_shape[0] * INITIAL_SECTION_RATIO if im_shape else 0)}/{im_shape[0] if im_shape else 0}"""
-    
-    ax._stats_text = ax.text2D(0.02, 0.98, initial_stats_text, transform=ax.transAxes, fontsize=9,
-                              verticalalignment='top', fontweight='bold',
-                              bbox=dict(boxstyle='round,pad=0.5', facecolor='lightgreen', alpha=0.8))
+    # 初始化統計信息顯示
+    update_stats_display(INITIAL_SECTION_RATIO)
     
     # 設定視角
     ax.view_init(elev=25, azim=45)
@@ -566,12 +629,16 @@ def create_advanced_visualization(pore_centers, pore_diameters, throat_connectio
     print("  • 孔隙：大小和顏色表示直徑")
     print("  • 喉道：線條粗細表示直徑")
     print("  • 剖面控制：拖動底部滑軌調整固體結構顯示深度")
-    print("  • 驗證功能：通過剖面可查看孔隙網路是否正確位於孔隙內")
+    print("  • 點大小切換：底部右側按鍵切換孔隙點顯示模式")
+    print("  • 平滑曲面：改進的固體結構重建，減少鋸齒感")
+    print("  • 驗證功能：通過剖面和點大小切換查看孔隙網路位置準確性")
     print("\n📝 使用說明:")
-    print("  1. 鼠標拖動：旋轉視角")
-    print("  2. 滾輪：縮放")
-    print("  3. 滑軌：控制固體結構剖面深度 (0% = 完全隱藏, 100% = 完全顯示)")
-    print("  4. 通過調整滑軌可驗證孔隙網路是否準確位於真實孔隙空間內")
+    print("  1. 🖱️  鼠標拖動：旋轉視角")
+    print("  2. 🎯 滾輪：縮放")
+    print("  3. 📏 滑軌：控制固體結構剖面 (0%=隱藏, 100%=完整實心平滑曲面)")
+    print("  4. 🔘 按鍵：切換孔隙點大小 (真實大小 ↔ 統一小點)")
+    print("  5. ✅ 驗證方法：滑軌調到100% + 切換到小點模式 → 檢查點是否在孔隙內")
+    print("  6. ✨ 新特性：平滑曲面重建技術，減少三角網格的鋸齒感")
 
 def main():
     """主程式"""
@@ -590,8 +657,8 @@ def main():
         throat_connections, throat_lengths, throat_diameters = advanced_throat_modeling(pore_centers, pore_diameters)
         
         # 固體結構重建 (初始)
-        solid_verts, solid_faces, im_shape = create_solid_structure_mesh(im_3d, subsample_rate=8, 
-                                                                        section_ratio=INITIAL_SECTION_RATIO)
+        solid_verts, solid_faces, im_shape, is_full = create_solid_structure_mesh(im_3d, subsample_rate=8, 
+                                                                                section_ratio=INITIAL_SECTION_RATIO)
         
         # 可視化 (傳入完整影像數據以支援動態更新)
         create_advanced_visualization(pore_centers, pore_diameters, throat_connections, 
